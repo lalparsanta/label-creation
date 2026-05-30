@@ -136,6 +136,9 @@ _DEFAULTS = {
     "openai_key":         "",
     "use_ai":             False,
     "error":              None,
+    # Tracking tab
+    "tracking_out":       None,
+    "tracking_log":       "",
     # Internal flags
     "_refs_loaded":       False,
 }
@@ -194,6 +197,34 @@ def _read_bytes(path: str | None) -> bytes | None:
     return None
 
 
+def _log_skipped_to_nonshipment(ns_path: str, skipped_oids: list[str]) -> None:
+    """Append manually-removed order IDs to the non-shipment tracker as SKIPPED - MANUAL."""
+    if not skipped_oids or not ns_path or not os.path.exists(ns_path):
+        return
+    import openpyxl
+    OIDS_SHEET  = "OIDS"
+    AMAZON_URL  = "https://sellercentral.amazon.co.uk/orders-v3/order/{oid}"
+    today_str   = date.today().strftime("%d-%b-%Y").upper()
+    wb = openpyxl.load_workbook(ns_path)
+    if OIDS_SHEET not in wb.sheetnames:
+        wb.close()
+        return
+    ws = wb[OIDS_SHEET]
+    existing = {str(row[2]).strip().upper() for row in ws.iter_rows(min_row=2, values_only=True) if row[2]}
+    next_row = ws.max_row + 1
+    for oid in skipped_oids:
+        if oid.strip().upper() not in existing:
+            ws.cell(row=next_row, column=1, value=today_str)
+            ws.cell(row=next_row, column=2, value=AMAZON_URL.format(oid=oid))
+            ws.cell(row=next_row, column=3, value=oid)
+            ws.cell(row=next_row, column=4, value="SKIPPED - MANUAL")
+            ws.cell(row=next_row, column=5, value="")
+            existing.add(oid.strip().upper())
+            next_row += 1
+    wb.save(ns_path)
+    wb.close()
+
+
 def _reset():
     for k in ("stage", "pipeline_state", "logs_phase1", "logs_phase2",
                "out_dhl", "out_audit", "out_nonship", "out_dzone",
@@ -225,7 +256,7 @@ def run_phase1(input_bytes: bytes) -> tuple:
 
 
 # ─── Phase 2: steps 5–11 ──────────────────────────────────────────────────────
-def run_phase2(pipeline_state) -> tuple:
+def run_phase2(pipeline_state, skipped_oids: list[str] | None = None) -> tuple:
     log_buf = io.StringIO()
     outputs: dict[str, bytes] = {}
 
@@ -257,6 +288,10 @@ def run_phase2(pipeline_state) -> tuple:
                 _step10(state)
                 _step11(state, non_shipped_filepath=ns_path)
 
+            # Log manually-skipped orders so they're filtered next run
+            if skipped_oids:
+                _log_skipped_to_nonshipment(ns_path, skipped_oids)
+
             today = date.today().strftime("%Y-%m-%d")
             for fname, key in [
                 (f"dhl_import_{today}.csv",  "dhl"),
@@ -275,6 +310,84 @@ def run_phase2(pipeline_state) -> tuple:
             return outputs, log_buf.getvalue()
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ─── Tracking tab helper ─────────────────────────────────────────────────────
+def _run_tracking(csv_bytes: bytes) -> tuple[bytes, str]:
+    """Convert DHL report CSV → Amazon tracking .txt. Returns (txt_bytes, log_str)."""
+    from datetime import datetime as _dt
+
+    log = io.StringIO()
+
+    df = pd.read_csv(
+        io.BytesIO(csv_bytes),
+        dtype={"Shipment number": str, "Alternative reference": str},
+    )
+
+    required = {"Customer reference", "Shipment number", "Alternative reference"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"DHL report is missing columns: {missing}")
+
+    df = df[["Customer reference", "Shipment number", "Alternative reference"]].copy()
+    log.write(f"Loaded {len(df)} row(s) from DHL report.\n\n")
+
+    # ── Filter to today only ──────────────────────────────────────────────────
+    today_dt = _dt.today()
+
+    def _parse(val):
+        for fmt in ("%d-%b", "%d-%b-%y", "%d-%b-%Y", "%d/%m/%Y", "%d/%m/%y"):
+            try:
+                return _dt.strptime(str(val).strip(), fmt)
+            except ValueError:
+                continue
+        return None
+
+    def _is_today(d):
+        if d is None:
+            return False
+        if d.year == 1900:   # parsed without year e.g. "25-May"
+            return d.day == today_dt.day and d.month == today_dt.month
+        return d.date() == today_dt.date()
+
+    today_mask = df["Alternative reference"].apply(_parse).apply(_is_today)
+    dropped = (~today_mask).sum()
+
+    if dropped:
+        sample = ", ".join(df.loc[~today_mask, "Alternative reference"].astype(str).unique()[:10])
+        log.write(f"Dropped {dropped} row(s) not dated today ({today_dt.strftime('%d-%b')}).\n")
+        log.write(f"Dates found: {sample}\n\n")
+
+    df = df[today_mask].copy()
+
+    if df.empty:
+        log.write(f"No rows for today ({today_dt.strftime('%d-%b')}) — output will have headers only.\n")
+    else:
+        log.write(f"{len(df)} row(s) for today — building Amazon tracking file.\n")
+
+    # ── Build Amazon DataFrame ────────────────────────────────────────────────
+    AMAZON_COLUMNS = [
+        "order-id", "order-item-id", "quantity", "ship-date",
+        "carrier-code", "carrier-name", "tracking-number", "ship-method",
+        "transparency_code", "ship_from_address_name", "ship_from_address_line1",
+        "ship_from_address_line2", "ship_from_address_line3", "ship_from_address_city",
+        "ship_from_address_county", "ship_from_address_state_or_region",
+        "ship_from_address_postalcode", "ship_from_address_countrycode",
+    ]
+    today_amz = f"{today_dt.month}/{today_dt.day}/{today_dt.year}"
+    out = pd.DataFrame(index=df.index, columns=AMAZON_COLUMNS)
+    out["order-id"]        = df["Customer reference"].str.strip()
+    out["tracking-number"] = df["Shipment number"].astype(str).str.strip()
+    out["ship-date"]       = today_amz
+    out["carrier-code"]    = "DHL eCommerce"
+    out["ship-method"]     = "Premier 24"
+    out = out.fillna("").reset_index(drop=True)
+
+    # ── Export to bytes ───────────────────────────────────────────────────────
+    buf = io.StringIO()
+    out.to_csv(buf, sep="\t", index=False, lineterminator="\r\n")
+    log.write(f"\nDone. {len(out)} row(s) written.")
+    return buf.getvalue().encode("utf-8"), log.getvalue()
 
 
 # ─── Sidebar ──────────────────────────────────────────────────────────────────
@@ -334,219 +447,262 @@ with st.sidebar:
 
 # ─── Main content ─────────────────────────────────────────────────────────────
 st.title("DHL Label Creator")
-st.caption("Amazon unshipped orders (.txt) → DHL import CSV")
 
-if st.session_state.error:
-    st.error(f"**Error:** {st.session_state.error}")
-    if st.button("Dismiss"):
-        st.session_state.error = None
-        st.rerun()
-    st.stop()
+tab1, tab2 = st.tabs(["Label Creation", "Amazon Tracking Update"])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Stage 1: Upload
+# Tab 1 — Label Creation Pipeline
 # ══════════════════════════════════════════════════════════════════════════════
-if st.session_state.stage == "upload":
-    st.subheader("Upload Amazon Unshipped Orders")
-    st.markdown(
-        "Export the **unshipped orders** report from Amazon Seller Central "
-        "(`Orders → Manage Orders → Unshipped → Export`), then upload the `.txt` file."
-    )
+with tab1:
+    st.caption("Amazon unshipped orders (.txt) → DHL import CSV")
 
-    amazon_file = st.file_uploader(
-        "Amazon unshipped orders (.txt, tab-delimited)",
-        type=["txt"],
-        key="amazon_uploader",
-    )
+    if st.session_state.error:
+        st.error(f"**Error:** {st.session_state.error}")
+        if st.button("Dismiss"):
+            st.session_state.error = None
+            st.rerun()
 
-    if amazon_file:
-        st.info(f"File ready: **{amazon_file.name}** ({len(amazon_file.getvalue()) // 1024} KB)")
+    elif st.session_state.stage == "upload":
+        st.subheader("Upload Amazon Unshipped Orders")
+        st.markdown(
+            "Export the **unshipped orders** report from Amazon Seller Central "
+            "(`Orders → Manage Orders → Unshipped → Export`), then upload the `.txt` file."
+        )
 
-        if st.button("Run Pre-Processing (Steps 1–3)", type="primary"):
-            with st.spinner("Ingesting, filtering existing orders, and parsing SKUs…"):
-                try:
-                    state, logs = run_phase1(amazon_file.getvalue())
-                    st.session_state.pipeline_state = state
-                    st.session_state.logs_phase1    = logs
-                    st.session_state.stage          = "sku_review"
+        amazon_file = st.file_uploader(
+            "Amazon unshipped orders (.txt, tab-delimited)",
+            type=["txt"],
+            key="amazon_uploader",
+        )
+
+        if amazon_file:
+            st.info(f"File ready: **{amazon_file.name}** ({len(amazon_file.getvalue()) // 1024} KB)")
+
+            if st.button("Run Pre-Processing (Steps 1–3)", type="primary"):
+                with st.spinner("Ingesting, filtering existing orders, and parsing SKUs…"):
+                    try:
+                        state, logs = run_phase1(amazon_file.getvalue())
+                        st.session_state.pipeline_state = state
+                        st.session_state.logs_phase1    = logs
+                        st.session_state.stage          = "sku_review"
+                        st.rerun()
+                    except Exception as exc:
+                        st.session_state.error = str(exc)
+                        st.rerun()
+
+    elif st.session_state.stage == "sku_review":
+        state = st.session_state.pipeline_state
+
+        with st.expander("Pre-processing log (steps 1–3)", expanded=False):
+            st.code(st.session_state.logs_phase1, language=None)
+
+        st.subheader("SKU Review")
+        st.markdown(
+            f"**{len(state.df)} orders** ready. "
+            "Tick **Remove** on any order that should NOT be labeled, then click Approve."
+        )
+
+        review_cols = [c for c in ["order-id", "sku", "supplier", "uid", "brand", "color", "size", "pack"]
+                       if c in state.df.columns]
+        review_df = state.df[review_cols].copy()
+        review_df.insert(0, "Remove", False)
+
+        edited = st.data_editor(
+            review_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Remove": st.column_config.CheckboxColumn(
+                    "Remove",
+                    help="Tick to exclude this order",
+                    default=False,
+                ),
+            },
+        )
+
+        flagged_oids = (
+            edited.loc[edited["Remove"].astype(bool), "order-id"].tolist()
+            if "order-id" in edited.columns else []
+        )
+        if flagged_oids:
+            st.warning(f"**{len(flagged_oids)} order(s) will be removed:** {', '.join(str(o) for o in flagged_oids)}")
+
+        col_ok, col_back = st.columns([3, 1])
+
+        with col_ok:
+            if st.button("Approve & Generate Labels", type="primary", use_container_width=True):
+                rows_in_gate = len(state.df)
+                if flagged_oids:
+                    mask = state.df["order-id"].isin(flagged_oids)
+                    state.df = state.df[~mask].copy().reset_index(drop=True)
+
+                if len(state.df) == 0:
+                    st.session_state.error = "No orders remain after SKU review — nothing to label."
+                    st.session_state.stage = "upload"
                     st.rerun()
-                except Exception as exc:
-                    st.session_state.error = str(exc)
-                    st.rerun()
 
+                state.log(
+                    step="step4_sku_gate",
+                    rows_in=rows_in_gate,
+                    note=f"Approved via web UI; removed {len(flagged_oids)} order(s)",
+                )
+                st.session_state.pipeline_state = state
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Stage 2: SKU Review Gate
-# ══════════════════════════════════════════════════════════════════════════════
-elif st.session_state.stage == "sku_review":
-    state = st.session_state.pipeline_state
+                with st.spinner("Running steps 5–11 (weights, D-zone, address, AI trim, export)…"):
+                    try:
+                        outputs, logs = run_phase2(state, skipped_oids=flagged_oids)
+                        st.session_state.out_dhl     = outputs.get("dhl")
+                        st.session_state.out_audit   = outputs.get("audit")
+                        st.session_state.out_dzone   = outputs.get("dzone")
+                        st.session_state.out_nonship = outputs.get("non_shipment")
+                        st.session_state.logs_phase2 = logs
 
-    with st.expander("Pre-processing log (steps 1–3)", expanded=False):
-        st.code(st.session_state.logs_phase1, language=None)
+                        # ── Auto-commit updated non-shipment tracker to GitHub ──
+                        token, repo = _gh_secrets()
+                        if (token and repo
+                                and st.session_state.ns_sha
+                                and st.session_state.out_nonship):
+                            today_str = date.today().strftime("%d-%b-%Y")
+                            new_sha = _gh_put(
+                                token, repo,
+                                _GH_NS_PATH,
+                                st.session_state.out_nonship,
+                                st.session_state.ns_sha,
+                                f"Update non-shipment tracker {today_str}",
+                            )
+                            if new_sha:
+                                st.session_state.ns_sha             = new_sha
+                                st.session_state.non_shipment_bytes = st.session_state.out_nonship
+                                st.session_state.gh_update_ok       = True
+                            else:
+                                st.session_state.gh_update_ok = False
+                        else:
+                            st.session_state.gh_update_ok = None
 
-    st.subheader("SKU Review")
-    st.markdown(
-        f"**{len(state.df)} orders** ready. "
-        "Tick **Remove** on any order that should NOT be labeled, then click Approve."
-    )
+                        st.session_state.stage = "complete"
+                        st.rerun()
+                    except Exception as exc:
+                        st.session_state.error = str(exc)
+                        st.rerun()
 
-    review_cols = [c for c in ["order-id", "sku", "supplier", "uid", "brand", "color", "size", "pack"]
-                   if c in state.df.columns]
-    review_df = state.df[review_cols].copy()
-    review_df.insert(0, "Remove", False)
-
-    edited = st.data_editor(
-        review_df,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Remove": st.column_config.CheckboxColumn(
-                "Remove",
-                help="Tick to exclude this order",
-                default=False,
-            ),
-        },
-    )
-
-    flagged_oids = (
-        edited.loc[edited["Remove"].astype(bool), "order-id"].tolist()
-        if "order-id" in edited.columns else []
-    )
-    if flagged_oids:
-        st.warning(f"**{len(flagged_oids)} order(s) will be removed:** {', '.join(str(o) for o in flagged_oids)}")
-
-    col_ok, col_back = st.columns([3, 1])
-
-    with col_ok:
-        if st.button("Approve & Generate Labels", type="primary", use_container_width=True):
-            rows_in_gate = len(state.df)
-            if flagged_oids:
-                mask = state.df["order-id"].isin(flagged_oids)
-                state.df = state.df[~mask].copy().reset_index(drop=True)
-
-            if len(state.df) == 0:
-                st.session_state.error = "No orders remain after SKU review — nothing to label."
-                st.session_state.stage = "upload"
+        with col_back:
+            if st.button("Back / Re-upload", use_container_width=True):
+                _reset()
                 st.rerun()
 
-            state.log(
-                step="step4_sku_gate",
-                rows_in=rows_in_gate,
-                note=f"Approved via web UI; removed {len(flagged_oids)} order(s)",
+    elif st.session_state.stage == "complete":
+        st.success("Pipeline complete!")
+
+        if st.session_state.gh_update_ok is True:
+            st.info("Non-shipment tracker updated in GitHub — next run will see today's orders.")
+        elif st.session_state.gh_update_ok is False:
+            st.warning(
+                "Could not auto-update non-shipment tracker on GitHub. "
+                "Download the updated file below and re-upload it next session."
             )
-            st.session_state.pipeline_state = state
 
-            with st.spinner("Running steps 5–11 (weights, D-zone, address, AI trim, export)…"):
-                try:
-                    outputs, logs = run_phase2(state)
-                    st.session_state.out_dhl     = outputs.get("dhl")
-                    st.session_state.out_audit   = outputs.get("audit")
-                    st.session_state.out_dzone   = outputs.get("dzone")
-                    st.session_state.out_nonship = outputs.get("non_shipment")
-                    st.session_state.logs_phase2 = logs
+        today = date.today().strftime("%Y-%m-%d")
+        left, right = st.columns(2)
 
-                    # ── Auto-commit updated non-shipment tracker to GitHub ────
-                    token, repo = _gh_secrets()
-                    if (token and repo
-                            and st.session_state.ns_sha
-                            and st.session_state.out_nonship):
-                        today_str = date.today().strftime("%d-%b-%Y")
-                        new_sha = _gh_put(
-                            token, repo,
-                            _GH_NS_PATH,
-                            st.session_state.out_nonship,
-                            st.session_state.ns_sha,
-                            f"Update non-shipment tracker {today_str}",
-                        )
-                        if new_sha:
-                            st.session_state.ns_sha    = new_sha
-                            st.session_state.non_shipment_bytes = st.session_state.out_nonship
-                            st.session_state.gh_update_ok = True
-                        else:
-                            st.session_state.gh_update_ok = False
-                    else:
-                        st.session_state.gh_update_ok = None
+        with left:
+            if st.session_state.out_dhl:
+                st.download_button(
+                    "Download DHL Import CSV",
+                    data=st.session_state.out_dhl,
+                    file_name=f"dhl_import_{today}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    type="primary",
+                )
+            else:
+                st.warning("DHL import file was not generated.")
 
-                    st.session_state.stage = "complete"
-                    st.rerun()
-                except Exception as exc:
-                    st.session_state.error = str(exc)
-                    st.rerun()
+            if st.session_state.out_audit:
+                st.download_button(
+                    "Download Audit Log",
+                    data=st.session_state.out_audit,
+                    file_name=f"audit_log_{today}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
 
-    with col_back:
-        if st.button("Back / Re-upload", use_container_width=True):
+        with right:
+            if st.session_state.out_nonship:
+                st.download_button(
+                    "Download Updated Non-Shipment Tracker",
+                    data=st.session_state.out_nonship,
+                    file_name=f"non-shipment-updated-{today}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    help="Only needed if GitHub auto-sync failed.",
+                )
+
+            if st.session_state.out_dzone:
+                st.download_button(
+                    "Download Dropped D-Zone Orders",
+                    data=st.session_state.out_dzone,
+                    file_name=f"dzone_dropped_{today}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+
+        with st.expander("Full pipeline log", expanded=False):
+            st.code(
+                st.session_state.logs_phase1 + "\n" + st.session_state.logs_phase2,
+                language=None,
+            )
+
+        st.divider()
+        if st.button("Process Another Batch", type="secondary"):
             _reset()
             st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Stage 3: Complete — download results
+# Tab 2 — Amazon Tracking Update
 # ══════════════════════════════════════════════════════════════════════════════
-elif st.session_state.stage == "complete":
-    st.success("Pipeline complete!")
+with tab2:
+    st.caption("DHL report CSV → Amazon tracking update .txt")
+    st.subheader("Upload DHL Report")
+    st.markdown(
+        "Download the shipment report from DHL, then upload the CSV here. "
+        "The app filters to **today's rows only** and produces the Amazon tracking file."
+    )
 
-    # GitHub sync status
-    if st.session_state.gh_update_ok is True:
-        st.info("Non-shipment tracker automatically updated in GitHub — next run will see today's orders.")
-    elif st.session_state.gh_update_ok is False:
-        st.warning(
-            "Could not auto-update non-shipment tracker on GitHub (SHA conflict or network issue). "
-            "Download the updated file below and re-upload it next session."
+    dhl_csv = st.file_uploader(
+        "DHL report (.csv)",
+        type=["csv"],
+        key="tracking_uploader",
+    )
+
+    if dhl_csv:
+        st.info(f"File ready: **{dhl_csv.name}**")
+
+        if st.button("Generate Amazon Tracking File", type="primary"):
+            with st.spinner("Processing…"):
+                try:
+                    txt_bytes, log = _run_tracking(dhl_csv.getvalue())
+                    st.session_state.tracking_out = txt_bytes
+                    st.session_state.tracking_log = log
+                except Exception as exc:
+                    st.error(f"**Error:** {exc}")
+
+    if st.session_state.tracking_out:
+        today = date.today().strftime("%Y-%m-%d")
+        st.download_button(
+            "Download Amazon Tracking .txt",
+            data=st.session_state.tracking_out,
+            file_name=f"Amazon_Trackings_Update_DHL_{today}.txt",
+            mime="text/plain",
+            use_container_width=True,
+            type="primary",
         )
 
-    today = date.today().strftime("%Y-%m-%d")
-    left, right = st.columns(2)
+        with st.expander("Processing log", expanded=True):
+            st.code(st.session_state.tracking_log, language=None)
 
-    with left:
-        if st.session_state.out_dhl:
-            st.download_button(
-                "Download DHL Import CSV",
-                data=st.session_state.out_dhl,
-                file_name=f"dhl_import_{today}.csv",
-                mime="text/csv",
-                use_container_width=True,
-                type="primary",
-            )
-        else:
-            st.warning("DHL import file was not generated.")
-
-        if st.session_state.out_audit:
-            st.download_button(
-                "Download Audit Log",
-                data=st.session_state.out_audit,
-                file_name=f"audit_log_{today}.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-
-    with right:
-        if st.session_state.out_nonship:
-            st.download_button(
-                "Download Updated Non-Shipment Tracker",
-                data=st.session_state.out_nonship,
-                file_name=f"non-shipment-updated-{today}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-                help="Only needed if GitHub auto-sync failed.",
-            )
-
-        if st.session_state.out_dzone:
-            st.download_button(
-                "Download Dropped D-Zone Orders",
-                data=st.session_state.out_dzone,
-                file_name=f"dzone_dropped_{today}.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-
-    with st.expander("Full pipeline log", expanded=False):
-        st.code(
-            st.session_state.logs_phase1 + "\n" + st.session_state.logs_phase2,
-            language=None,
-        )
-
-    st.divider()
-    if st.button("Process Another Batch", type="secondary"):
-        _reset()
-        st.rerun()
+        if st.button("Clear / New File"):
+            st.session_state.tracking_out = None
+            st.session_state.tracking_log = ""
+            st.rerun()

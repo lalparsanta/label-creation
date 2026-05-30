@@ -28,7 +28,7 @@ DHL_COLUMN_MAP = {
     "*Delivery address 1*":                       "ship-address-1",
     "Delivery address 2":                         "ship-address-2",
     "Delivery address 3":                         "ship-address-3",
-    "*Delivery town*":                            "ship-city",
+    " *Delivery town*":                            "ship-city",
     "*Delivery postal code (must have a space)*": "ship-postal-code",
     "Delivery county":                            "ship-state",
     "Country":                                    "__empty",
