@@ -1,6 +1,7 @@
 import sys
 import pandas as pd
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 
@@ -29,6 +30,15 @@ AMAZON_COLUMNS = [
 # ── Static values ────────────────────────────────────────────────────────────
 CARRIER_CODE = "DHL eCommerce"
 SHIP_METHOD  = "Premier 24"
+
+
+def fix_tracking_number(val: str) -> str:
+    """Convert scientific notation like '6.0120248490595E+13' to '60120248490595'."""
+    val = str(val).strip()
+    try:
+        return str(int(Decimal(val)))
+    except (InvalidOperation, ValueError):
+        return val
 
 
 def load_dhl_report(path: str) -> pd.DataFrame:
@@ -94,7 +104,7 @@ def build_amazon_df(dhl_df: pd.DataFrame) -> pd.DataFrame:
 
     # Mapped columns
     out["order-id"]        = dhl_df["Customer reference"].str.strip()
-    out["tracking-number"] = dhl_df["Shipment number"].astype(str).str.strip()
+    out["tracking-number"] = dhl_df["Shipment number"].astype(str).str.strip().apply(fix_tracking_number)
 
     # Static / derived columns
     out["ship-date"]    = today_amz
